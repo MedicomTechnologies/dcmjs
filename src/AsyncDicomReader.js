@@ -422,7 +422,7 @@ export class AsyncDicomReader {
 
     async readSequence(listener, sqTagInfo, options) {
         const { length } = sqTagInfo;
-        const { stream, syntax } = this;
+        const { stream } = this;
         const endOffset =
             length === UNDEFINED_LENGTH_FIX
                 ? Number.MAX_SAFE_INTEGER
@@ -433,7 +433,7 @@ export class AsyncDicomReader {
             (await stream.ensureAvailable(12))
         ) {
             readLog.debug("readSequence loop", stream.offset, endOffset);
-            const tagInfo = this.readTagHeader(syntax, options);
+            const tagInfo = this.readTagHeader();
             const { tag } = tagInfo;
             if (tag === TagHex.Item) {
                 listener.startObject();
@@ -738,6 +738,16 @@ export class AsyncDicomReader {
         return vr === "SQ" || (vr === "UN" && length === UNDEFINED_LENGTH_FIX);
     }
 
+    normalizeReadOptions(options = {}) {
+        return {
+            ...options,
+            untilTag: DicomMetaDictionary.normalizeTagOption(
+                options.untilTag,
+                "untilTag"
+            )
+        };
+    }
+
     /**
      * Reads a tag header.
      */
@@ -747,6 +757,7 @@ export class AsyncDicomReader {
             includeUntilTagValue: false
         }
     ) {
+        options = this.normalizeReadOptions(options);
         const { stream, syntax } = this;
         const { untilTag, includeUntilTagValue } = options;
         const implicit = syntax == IMPLICIT_LITTLE_ENDIAN;

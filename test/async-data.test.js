@@ -61,7 +61,7 @@ describe("AsyncDicomReader", () => {
 
     it("stops a node stream when a sorted tag passes the requested untilTag.", async () => {
         const filePath = "test/sample-dicom.dcm";
-        const missingTagBeforeRows = "00280009";
+        const missingTagBeforeRows = "(0028,0009)";
         const maxReadAhead = 12;
         const highWaterMark = 4;
         const reader = new AsyncDicomReader();
@@ -87,6 +87,23 @@ describe("AsyncDicomReader", () => {
         );
         expect(reader.stopInfo.stopOffset).toBe(reader.stopInfo.tagStartOffset);
         expect(stream.destroyed).toBe(true);
+    });
+
+    it("throws when untilTag is not a valid tag.", async () => {
+        const buffer = fs.readFileSync("test/sample-dicom.dcm");
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+
+        reader.stream.addBuffer(buffer);
+        reader.stream.setComplete();
+
+        await expect(
+            reader.readFile({
+                listener,
+                untilTag: "PixelData",
+                includeUntilTagValue: false
+            })
+        ).rejects.toThrow("Invalid untilTag: PixelData");
     });
 
     it("does not apply top-level sorted tag stops inside sequence items.", async () => {
