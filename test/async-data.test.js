@@ -24,6 +24,73 @@ const { DicomMetadataListener } = dcmjs.utilities;
 DicomDict.setDicomMessageClass(DicomMessage);
 
 describe("AsyncDicomReader", () => {
+    it("stops a node stream before reading pixel data when untilTag matches.", async () => {
+        const filePath = "test/sample-dicom.dcm";
+        const maxReadAhead = 12;
+        const highWaterMark = 4;
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+        const stream = fs.createReadStream(filePath, {
+            highWaterMark
+        });
+
+        const { dict } = await reader.readFileFromAsyncStream(stream, {
+            listener,
+            untilTag: TagHex.PixelData,
+            includeUntilTagValue: false,
+            streamOptions: { maxReadAhead }
+        });
+
+        expect(dict[TagHex.Rows].Value[0]).toBe(512);
+        expect(dict[TagHex.PixelData]).toBeUndefined();
+        expect(reader.stopInfo).toEqual(
+            expect.objectContaining({
+                reason: "untilTag",
+                tag: TagHex.PixelData
+            })
+        );
+        expect(reader.stopInfo.valueOffset).toBeUndefined();
+        expect(reader.stopInfo.stopOffset).toBe(
+            reader.stopInfo.tagStartOffset + 4
+        );
+        expect(reader.stream.size).toBeLessThanOrEqual(
+            reader.stopInfo.tagStartOffset + maxReadAhead
+        );
+        expect(stream.destroyed).toBe(true);
+    });
+
+    it("stops a node stream after the shouldStop callback accepts a read tag.", async () => {
+        const filePath = "test/sample-dicom.dcm";
+        const fileSize = fs.statSync(filePath).size;
+        const maxReadAhead = 12;
+        const highWaterMark = 4;
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+        const stream = fs.createReadStream(filePath, {
+            highWaterMark
+        });
+
+        const { dict } = await reader.readFileFromAsyncStream(stream, {
+            listener,
+            shouldStop: ({ tagInfo }) => tagInfo.tag === TagHex.Rows,
+            streamOptions: { maxReadAhead }
+        });
+
+        expect(dict[TagHex.Rows].Value[0]).toBe(512);
+        expect(dict[TagHex.PixelData]).toBeUndefined();
+        expect(reader.stopInfo).toEqual(
+            expect.objectContaining({
+                reason: "shouldStop",
+                tag: TagHex.Rows
+            })
+        );
+        expect(reader.stopInfo.valueOffset).toBeLessThan(
+            reader.stopInfo.stopOffset
+        );
+        expect(reader.stream.size).toBeLessThan(fileSize);
+        expect(stream.destroyed).toBe(true);
+    });
+
     test("DICOM part 10 complete listener uncompressed", async () => {
         const buffer = fs.readFileSync("test/sample-dicom.dcm");
         const reader = new AsyncDicomReader();
