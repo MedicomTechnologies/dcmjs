@@ -330,6 +330,12 @@ export class AsyncDicomReader {
             stream.consume();
             const tagInfo = this.readTagHeader(options);
 
+            if (tagInfo.isPastUntilTag) {
+                stream.offset = tagInfo.tagStartOffset;
+                this.setStopInfo("stopOnGreaterTag", tagInfo);
+                break;
+            }
+
             // Stop when the requested tag boundary is reached.  readTagHeader()
             // has already consumed the 4-byte tag but nothing beyond it, so
             // stream.offset now points at the first byte after the tag (i.e.
@@ -442,10 +448,14 @@ export class AsyncDicomReader {
                     itemLength === UNDEFINED_LENGTH_FIX
                         ? endOffset
                         : Math.min(stream.offset + itemLength, endOffset);
-                await this.read(listener, {
+                const itemOptions = {
                     ...options,
+                    untilTag: null,
+                    includeUntilTagValue: false,
+                    stopOnGreaterTag: false,
                     untilOffset: itemUntilOffset
-                });
+                };
+                await this.read(listener, itemOptions);
                 if (this.stopInfo) {
                     return;
                 }
@@ -758,6 +768,18 @@ export class AsyncDicomReader {
                     stopOffset: stream.offset
                 };
             }
+        }
+
+        if (untilTag && options.stopOnGreaterTag && tag > untilTag) {
+            return {
+                tag,
+                tagObj,
+                vr: 0,
+                values: 0,
+                isPastUntilTag: true,
+                tagStartOffset,
+                stopOffset: tagStartOffset
+            };
         }
 
         let length = null;

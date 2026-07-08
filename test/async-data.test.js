@@ -59,6 +59,119 @@ describe("AsyncDicomReader", () => {
         expect(stream.destroyed).toBe(true);
     });
 
+    it("stops a node stream when a sorted tag passes the requested untilTag.", async () => {
+        const filePath = "test/sample-dicom.dcm";
+        const missingTagBeforeRows = "00280009";
+        const maxReadAhead = 12;
+        const highWaterMark = 4;
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+        const stream = fs.createReadStream(filePath, {
+            highWaterMark
+        });
+
+        const { dict } = await reader.readFileFromAsyncStream(stream, {
+            listener,
+            untilTag: missingTagBeforeRows,
+            stopOnGreaterTag: true,
+            streamOptions: { maxReadAhead }
+        });
+
+        expect(dict[TagHex.Rows]).toBeUndefined();
+        expect(dict[TagHex.PixelData]).toBeUndefined();
+        expect(reader.stopInfo).toEqual(
+            expect.objectContaining({
+                reason: "stopOnGreaterTag",
+                tag: TagHex.Rows
+            })
+        );
+        expect(reader.stopInfo.stopOffset).toBe(reader.stopInfo.tagStartOffset);
+        expect(stream.destroyed).toBe(true);
+    });
+
+    it("does not apply top-level sorted tag stops inside sequence items.", async () => {
+        const missingTagBeforeRows = "00280009";
+        const referencedSeriesSequence = "00081115";
+        const nestedRows = 7;
+        const buffer = createSampleDicom({
+            dict: {
+                [referencedSeriesSequence]: {
+                    vr: "SQ",
+                    Value: [
+                        {
+                            [TagHex.Rows]: {
+                                vr: "US",
+                                Value: [nestedRows]
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+
+        reader.stream.addBuffer(buffer);
+        reader.stream.setComplete();
+        const { dict } = await reader.readFile({
+            listener,
+            untilTag: missingTagBeforeRows,
+            stopOnGreaterTag: true
+        });
+
+        expect(
+            dict[referencedSeriesSequence].Value[0][TagHex.Rows].Value[0]
+        ).toBe(nestedRows);
+        expect(dict[TagHex.Rows]).toBeUndefined();
+        expect(reader.stopInfo).toEqual(
+            expect.objectContaining({
+                reason: "stopOnGreaterTag",
+                tag: TagHex.Rows
+            })
+        );
+    });
+
+    it("does not apply top-level untilTag matches inside sequence items.", async () => {
+        const referencedSeriesSequence = "00081115";
+        const nestedRows = 7;
+        const buffer = createSampleDicom({
+            dict: {
+                [referencedSeriesSequence]: {
+                    vr: "SQ",
+                    Value: [
+                        {
+                            [TagHex.Rows]: {
+                                vr: "US",
+                                Value: [nestedRows]
+                            }
+                        }
+                    ]
+                }
+            }
+        });
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+
+        reader.stream.addBuffer(buffer);
+        reader.stream.setComplete();
+        const { dict } = await reader.readFile({
+            listener,
+            untilTag: TagHex.Rows,
+            includeUntilTagValue: false
+        });
+
+        expect(
+            dict[referencedSeriesSequence].Value[0][TagHex.Rows].Value[0]
+        ).toBe(nestedRows);
+        expect(dict[TagHex.Rows]).toBeUndefined();
+        expect(reader.stopInfo).toEqual(
+            expect.objectContaining({
+                reason: "untilTag",
+                tag: TagHex.Rows
+            })
+        );
+    });
+
     it("stops a node stream after the shouldStop callback accepts a read tag.", async () => {
         const filePath = "test/sample-dicom.dcm";
         const fileSize = fs.statSync(filePath).size;
