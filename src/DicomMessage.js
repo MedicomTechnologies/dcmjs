@@ -58,6 +58,7 @@ export class DicomMessage {
             stopOnGreaterTag: false
         }
     ) {
+        options = DicomMessage._normalizeReadOptions(options);
         const { ignoreErrors, untilTag, stopOnGreaterTag } = options;
         var dict = {};
         try {
@@ -212,6 +213,16 @@ export class DicomMessage {
         return dicomDict;
     }
 
+    static _normalizeReadOptions(options = {}) {
+        return {
+            ...options,
+            untilTag: DicomMetaDictionary.normalizeTagOption(
+                options.untilTag,
+                "untilTag"
+            )
+        };
+    }
+
     static writeTagObject(stream, tagString, vr, values, syntax, writeOptions) {
         var tag = Tag.fromString(tagString);
 
@@ -274,6 +285,7 @@ export class DicomMessage {
             includeUntilTagValue: false
         }
     ) {
+        options = DicomMessage._normalizeReadOptions(options);
         const { untilTag, includeUntilTagValue } = options;
         var implicit = syntax == IMPLICIT_LITTLE_ENDIAN ? true : false,
             isLittleEndian =

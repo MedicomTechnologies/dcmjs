@@ -11,6 +11,8 @@ export class BufferStream {
     view = new SplitDataView();
     /** The available listeners are those waiting for a query response */
     availableListeners = [];
+    readAheadListeners = [];
+    requestedAvailable = 0;
 
     /** Indicates if this buffer stream is complete/has finished being created */
     isComplete = false;
@@ -32,6 +34,7 @@ export class BufferStream {
     setComplete(value = true) {
         this.isComplete = value;
         this.notifyAvailableListeners();
+        this.notifyReadAheadListeners();
     }
 
     /**
@@ -54,9 +57,15 @@ export class BufferStream {
      */
     ensureAvailable(bytes = 1024) {
         if (!this.isAvailable(bytes)) {
+            this.requestedAvailable = Math.max(this.requestedAvailable, bytes);
+            this.notifyReadAheadListeners();
             return new Promise(resolve => {
                 const recheckAvailable = () => {
                     if (this.isAvailable(bytes)) {
+                        if (this.requestedAvailable <= bytes) {
+                            this.requestedAvailable = 0;
+                        }
+                        this.notifyReadAheadListeners();
                         resolve(true);
                         return;
                     }
@@ -350,21 +359,165 @@ export class BufferStream {
         if (this.offset > this.size) {
             this.size = this.offset;
         }
+        this.notifyReadAheadListeners();
         return step;
     }
 
     /**
      * Reads from an async stream delivering to addBuffer.
      */
-    async fromAsyncStream(stream) {
-        for await (const chunk of stream) {
-            const ab = chunk.buffer.slice(
+    async fromAsyncStream(stream, options = {}) {
+        return this.pumpAsyncStream(stream, options).finished;
+    }
+
+    /**
+     * Starts reading from an async stream and returns a handle that can abort
+     * the source without requiring callers to read the rest of it first.
+     */
+    pumpAsyncStream(stream, options = {}) {
+        const state = {
+            aborted: false,
+            reason: undefined
+        };
+
+        const abort = reason => {
+            if (state.aborted) {
+                return;
+            }
+            const abortReason = reason ?? BufferStream.createAbortReason();
+            state.aborted = true;
+            state.reason = abortReason;
+            if (options.cancelOnAbort !== false) {
+                if (
+                    options.destroyOnAbort !== false &&
+                    typeof stream.destroy === "function"
+                ) {
+                    stream.destroy(abortReason);
+                } else if (typeof stream.destroy !== "function") {
+                    state.cancelPromise = BufferStream.cancelSource(
+                        state.cancelSource,
+                        abortReason
+                    );
+                } else {
+                    state.cancelPromise = Promise.resolve();
+                }
+            }
+            this.setComplete();
+            this.notifyReadAheadListeners();
+        };
+
+        const finished = this._pumpAsyncStream(stream, state, options);
+
+        return {
+            abort,
+            finished,
+            get aborted() {
+                return state.aborted;
+            },
+            get reason() {
+                return state.reason;
+            }
+        };
+    }
+
+    async _pumpAsyncStream(stream, state, options) {
+        const source = BufferStream.asyncSourceFromStream(stream);
+        state.cancelSource = source.cancel;
+        try {
+            while (!state.aborted) {
+                const { done, value } = await source.next();
+                if (done || state.aborted) {
+                    break;
+                }
+                this.addBuffer(BufferStream.arrayBufferFromChunk(value));
+                await this.waitForReadAhead(options.maxReadAhead, state);
+            }
+        } catch (error) {
+            if (
+                state.aborted &&
+                BufferStream.isAbortError(error, state.reason)
+            ) {
+                return;
+            }
+            throw error;
+        } finally {
+            await state.cancelPromise;
+            source.release?.();
+            state.cancelSource = null;
+            this.setComplete();
+        }
+    }
+
+    static isAbortError(error, reason) {
+        return error === reason;
+    }
+
+    static createAbortReason() {
+        return new Error("BufferStream aborted");
+    }
+
+    static cancelSource(cancelSource, reason) {
+        try {
+            return Promise.resolve(cancelSource?.(reason)).catch(() => {});
+        } catch {
+            return Promise.resolve();
+        }
+    }
+
+    static asyncSourceFromStream(stream) {
+        if (typeof stream?.getReader === "function") {
+            const reader = stream.getReader();
+            return {
+                next: () => reader.read(),
+                cancel: reason => reader.cancel(reason),
+                release: () => reader.releaseLock()
+            };
+        }
+
+        const iterator = stream?.[Symbol.asyncIterator]?.();
+        if (iterator) {
+            return {
+                next: () => iterator.next(),
+                cancel: reason => iterator.return?.(reason)
+            };
+        }
+
+        throw new TypeError(
+            "Async stream must be an async iterable or ReadableStream"
+        );
+    }
+
+    static arrayBufferFromChunk(chunk) {
+        if (chunk instanceof ArrayBuffer) {
+            return chunk;
+        }
+        if (ArrayBuffer.isView(chunk)) {
+            return chunk.buffer.slice(
                 chunk.byteOffset,
                 chunk.byteOffset + chunk.byteLength
             );
-            this.addBuffer(ab);
         }
-        this.setComplete();
+        throw new TypeError("Async stream chunks must be ArrayBuffer views");
+    }
+    async waitForReadAhead(maxReadAhead, state) {
+        if (typeof maxReadAhead !== "number") {
+            return;
+        }
+
+        while (!state.aborted && this.isPastReadAheadLimit(maxReadAhead)) {
+            await new Promise(resolve => {
+                this.readAheadListeners.push(resolve);
+            });
+        }
+    }
+
+    isPastReadAheadLimit(maxReadAhead) {
+        const limit = this.readAheadLimit(maxReadAhead);
+        return limit === 0 ? this.available > 0 : this.available >= limit;
+    }
+
+    readAheadLimit(maxReadAhead) {
+        return Math.max(0, maxReadAhead, this.requestedAvailable);
     }
 
     /**
@@ -393,6 +546,12 @@ export class BufferStream {
     notifyAvailableListeners() {
         const existingListeners = [...this.availableListeners];
         this.availableListeners.splice(0, this.availableListeners.length);
+        existingListeners.forEach(listener => listener());
+    }
+
+    notifyReadAheadListeners() {
+        const existingListeners = [...this.readAheadListeners];
+        this.readAheadListeners.splice(0, this.readAheadListeners.length);
         existingListeners.forEach(listener => listener());
     }
 
