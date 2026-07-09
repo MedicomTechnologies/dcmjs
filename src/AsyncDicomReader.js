@@ -84,8 +84,10 @@ export class AsyncDicomReader {
             return streamOptions.awaitAbort;
         }
         return (
+            streamOptions.cancelOnAbort !== false &&
             streamOptions.destroyOnAbort !== false &&
-            typeof stream.destroy === "function"
+            (typeof stream.destroy === "function" ||
+                typeof stream.getReader === "function")
         );
     }
 

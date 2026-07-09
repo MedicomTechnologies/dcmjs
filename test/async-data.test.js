@@ -1,4 +1,5 @@
 import fs from "fs";
+import { ReadableStream } from "stream/web";
 import dcmjs from "../src/index.js";
 import {
     TagHex,
@@ -22,6 +23,16 @@ const { DicomMetadataListener } = dcmjs.utilities;
 
 // Ensure DicomMessage is set on DicomDict
 DicomDict.setDicomMessageClass(DicomMessage);
+
+async function waitFor(predicate) {
+    for (let attempts = 0; attempts < 100; attempts++) {
+        if (predicate()) {
+            return;
+        }
+        await new Promise(resolve => setTimeout(resolve, 0));
+    }
+    throw new Error("Timed out waiting for condition");
+}
 
 describe("AsyncDicomReader", () => {
     it("stops a node stream before reading pixel data when untilTag matches.", async () => {
@@ -57,6 +68,60 @@ describe("AsyncDicomReader", () => {
             reader.stopInfo.tagStartOffset + maxReadAhead
         );
         expect(stream.destroyed).toBe(true);
+    });
+
+    it("waits for a ReadableStream source to cancel before resolving.", async () => {
+        const buffer = createSampleDicom();
+        const bytes = new Uint8Array(buffer);
+        const maxReadAhead = 12;
+        const highWaterMark = 4;
+        let offset = 0;
+        let isReadResolved = false;
+        let resolveCancel;
+        const source = new ReadableStream({
+            pull(controller) {
+                if (offset >= bytes.length) {
+                    controller.close();
+                    return;
+                }
+                const nextOffset = Math.min(
+                    offset + highWaterMark,
+                    bytes.length
+                );
+                controller.enqueue(bytes.slice(offset, nextOffset));
+                offset = nextOffset;
+            },
+            cancel() {
+                return new Promise(resolve => {
+                    resolveCancel = resolve;
+                });
+            }
+        });
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+
+        const readPromise = reader
+            .readFileFromAsyncStream(source, {
+                listener,
+                untilTag: TagHex.PixelData,
+                includeUntilTagValue: false,
+                streamOptions: { maxReadAhead }
+            })
+            .then(result => {
+                isReadResolved = true;
+                return result;
+            });
+
+        await waitFor(() => resolveCancel);
+        await Promise.resolve();
+
+        expect(isReadResolved).toBe(false);
+
+        resolveCancel();
+        const { dict } = await readPromise;
+
+        expect(dict[TagHex.PixelData]).toBeUndefined();
+        expect(source.locked).toBe(false);
     });
 
     it("stops a node stream when a sorted tag passes the requested untilTag.", async () => {

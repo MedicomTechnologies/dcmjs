@@ -386,8 +386,20 @@ export class BufferStream {
             }
             state.aborted = true;
             state.reason = reason;
-            if (options.destroyOnAbort !== false) {
+            if (
+                options.cancelOnAbort !== false &&
+                options.destroyOnAbort !== false &&
+                typeof stream.destroy === "function"
+            ) {
                 stream.destroy?.(reason);
+            } else if (
+                options.cancelOnAbort !== false &&
+                options.destroyOnAbort !== false
+            ) {
+                state.cancelPromise = BufferStream.cancelSource(
+                    state.cancelSource,
+                    reason
+                );
             }
             this.setComplete();
             this.notifyReadAheadListeners();
@@ -408,12 +420,15 @@ export class BufferStream {
     }
 
     async _pumpAsyncStream(stream, state, options) {
+        const source = BufferStream.asyncSourceFromStream(stream);
+        state.cancelSource = source.cancel;
         try {
-            for await (const chunk of stream) {
-                if (state.aborted) {
+            while (!state.aborted) {
+                const { done, value } = await source.next();
+                if (done || state.aborted) {
                     break;
                 }
-                this.addBuffer(BufferStream.arrayBufferFromChunk(chunk));
+                this.addBuffer(BufferStream.arrayBufferFromChunk(value));
                 await this.waitForReadAhead(options.maxReadAhead, state);
             }
         } catch (error) {
@@ -421,8 +436,42 @@ export class BufferStream {
                 throw error;
             }
         } finally {
+            await state.cancelPromise;
+            source.release?.();
+            state.cancelSource = null;
             this.setComplete();
         }
+    }
+
+    static cancelSource(cancelSource, reason) {
+        try {
+            return Promise.resolve(cancelSource?.(reason)).catch(() => {});
+        } catch {
+            return Promise.resolve();
+        }
+    }
+
+    static asyncSourceFromStream(stream) {
+        if (typeof stream?.getReader === "function") {
+            const reader = stream.getReader();
+            return {
+                next: () => reader.read(),
+                cancel: reason => reader.cancel(reason),
+                release: () => reader.releaseLock()
+            };
+        }
+
+        const iterator = stream?.[Symbol.asyncIterator]?.();
+        if (iterator) {
+            return {
+                next: () => iterator.next(),
+                cancel: reason => iterator.return?.(reason)
+            };
+        }
+
+        throw new TypeError(
+            "Async stream must be an async iterable or ReadableStream"
+        );
     }
 
     static arrayBufferFromChunk(chunk) {

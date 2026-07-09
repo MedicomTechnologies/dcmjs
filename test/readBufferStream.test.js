@@ -1,4 +1,5 @@
 import { ReadBufferStream } from "../src/BufferStream";
+import { ReadableStream } from "stream/web";
 
 const size = 128;
 const buffer = new ArrayBuffer(size);
@@ -153,6 +154,64 @@ describe("ReadBufferStream Tests", () => {
             expect(stream.isAvailable(remaining + 1)).toBe(true);
             expect(stream.isAvailable(remaining, false)).toBe(true);
             expect(stream.isAvailable(remaining + 1, false)).toBe(false);
+        });
+    });
+
+    describe("async stream pumping", () => {
+        it("reads chunks from a ReadableStream source.", async () => {
+            const source = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new Uint8Array([1, 2]));
+                    controller.enqueue(new Uint8Array([3]));
+                    controller.close();
+                }
+            });
+            const stream = new ReadBufferStream(null, false);
+
+            await stream.fromAsyncStream(source);
+            stream.reset();
+
+            expect(stream.readUint8()).toBe(1);
+            expect(stream.readUint8()).toBe(2);
+            expect(stream.readUint8()).toBe(3);
+            expect(source.locked).toBe(false);
+        });
+
+        it("cancels a ReadableStream source when aborted.", async () => {
+            const cancelReason = new Error("stop reading");
+            let receivedCancelReason;
+            let resolveCancel;
+            let isFinished = false;
+            const source = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new Uint8Array([1, 2, 3]));
+                },
+                cancel(reason) {
+                    receivedCancelReason = reason;
+                    return new Promise(resolve => {
+                        resolveCancel = resolve;
+                    });
+                }
+            });
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(source, { maxReadAhead: 1 });
+
+            await stream.ensureAvailable(1);
+            pump.abort(cancelReason);
+            const finished = pump.finished.then(() => {
+                isFinished = true;
+            });
+            await Promise.resolve();
+
+            expect(isFinished).toBe(false);
+
+            resolveCancel();
+            await finished;
+
+            expect(receivedCancelReason).toBe(cancelReason);
+            expect(pump.aborted).toBe(true);
+            expect(stream.isComplete).toBe(true);
+            expect(source.locked).toBe(false);
         });
     });
 });
