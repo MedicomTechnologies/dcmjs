@@ -124,6 +124,85 @@ describe("AsyncDicomReader", () => {
         expect(source.locked).toBe(false);
     });
 
+    it("rejects when the source fails after enough bytes were buffered.", async () => {
+        const buffer = createSampleDicom();
+        const sourceError = new Error("source failed");
+        let readCount = 0;
+        const source = {
+            [Symbol.asyncIterator]() {
+                return {
+                    next() {
+                        readCount++;
+                        if (readCount === 1) {
+                            return Promise.resolve({
+                                done: false,
+                                value: new Uint8Array(buffer)
+                            });
+                        }
+                        return Promise.reject(sourceError);
+                    },
+                    return() {
+                        return Promise.resolve({ done: true });
+                    }
+                };
+            }
+        };
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+
+        await expect(
+            reader.readFileFromAsyncStream(source, {
+                listener,
+                untilTag: TagHex.PixelData,
+                includeUntilTagValue: false,
+                streamOptions: {
+                    awaitAbort: true,
+                    maxReadAhead: buffer.byteLength + 1
+                }
+            })
+        ).rejects.toBe(sourceError);
+    });
+
+    it("rejects abort-shaped source errors after early stop.", async () => {
+        const buffer = createSampleDicom();
+        const sourceError = new Error("upstream aborted");
+        sourceError.name = "AbortError";
+        let readCount = 0;
+        const source = {
+            [Symbol.asyncIterator]() {
+                return {
+                    next() {
+                        readCount++;
+                        if (readCount === 1) {
+                            return Promise.resolve({
+                                done: false,
+                                value: new Uint8Array(buffer)
+                            });
+                        }
+                        return Promise.reject(sourceError);
+                    },
+                    return() {
+                        return Promise.resolve({ done: true });
+                    }
+                };
+            }
+        };
+        const reader = new AsyncDicomReader();
+        const listener = new DicomMetadataListener();
+
+        await expect(
+            reader.readFileFromAsyncStream(source, {
+                listener,
+                untilTag: TagHex.PixelData,
+                includeUntilTagValue: false,
+                streamOptions: {
+                    awaitAbort: true,
+                    maxReadAhead: buffer.byteLength + 1
+                }
+            })
+        ).rejects.toBe(sourceError);
+    });
+
     it("stops a node stream when a sorted tag passes the requested untilTag.", async () => {
         const filePath = "test/sample-dicom.dcm";
         const missingTagBeforeRows = "(0028,0009)";

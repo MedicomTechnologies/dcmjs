@@ -85,7 +85,6 @@ export class AsyncDicomReader {
         }
         return (
             streamOptions.cancelOnAbort !== false &&
-            streamOptions.destroyOnAbort !== false &&
             (typeof stream.destroy === "function" ||
                 typeof stream.getReader === "function")
         );
@@ -93,13 +92,19 @@ export class AsyncDicomReader {
 
     async settlePumpAfterAbort(pump, shouldAwait) {
         const finished = pump.finished.catch(error => {
-            if (!pump.aborted) {
-                throw error;
+            if (
+                pump.aborted &&
+                ReadBufferStream.isAbortError(error, pump.reason)
+            ) {
+                return;
             }
+            throw error;
         });
 
         if (shouldAwait) {
             await finished;
+        } else {
+            finished.catch(() => {});
         }
     }
 

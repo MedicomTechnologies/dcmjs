@@ -384,22 +384,23 @@ export class BufferStream {
             if (state.aborted) {
                 return;
             }
+            const abortReason = reason ?? BufferStream.createAbortReason();
             state.aborted = true;
-            state.reason = reason;
-            if (
-                options.cancelOnAbort !== false &&
-                options.destroyOnAbort !== false &&
-                typeof stream.destroy === "function"
-            ) {
-                stream.destroy?.(reason);
-            } else if (
-                options.cancelOnAbort !== false &&
-                options.destroyOnAbort !== false
-            ) {
-                state.cancelPromise = BufferStream.cancelSource(
-                    state.cancelSource,
-                    reason
-                );
+            state.reason = abortReason;
+            if (options.cancelOnAbort !== false) {
+                if (
+                    options.destroyOnAbort !== false &&
+                    typeof stream.destroy === "function"
+                ) {
+                    stream.destroy(abortReason);
+                } else if (typeof stream.destroy !== "function") {
+                    state.cancelPromise = BufferStream.cancelSource(
+                        state.cancelSource,
+                        abortReason
+                    );
+                } else {
+                    state.cancelPromise = Promise.resolve();
+                }
             }
             this.setComplete();
             this.notifyReadAheadListeners();
@@ -432,15 +433,27 @@ export class BufferStream {
                 await this.waitForReadAhead(options.maxReadAhead, state);
             }
         } catch (error) {
-            if (!state.aborted) {
-                throw error;
+            if (
+                state.aborted &&
+                BufferStream.isAbortError(error, state.reason)
+            ) {
+                return;
             }
+            throw error;
         } finally {
             await state.cancelPromise;
             source.release?.();
             state.cancelSource = null;
             this.setComplete();
         }
+    }
+
+    static isAbortError(error, reason) {
+        return error === reason;
+    }
+
+    static createAbortReason() {
+        return new Error("BufferStream aborted");
     }
 
     static cancelSource(cancelSource, reason) {
@@ -486,7 +499,6 @@ export class BufferStream {
         }
         throw new TypeError("Async stream chunks must be ArrayBuffer views");
     }
-
     async waitForReadAhead(maxReadAhead, state) {
         if (typeof maxReadAhead !== "number") {
             return;

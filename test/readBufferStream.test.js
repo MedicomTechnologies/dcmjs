@@ -1,4 +1,5 @@
 import { ReadBufferStream } from "../src/BufferStream";
+import { Readable } from "stream";
 import { ReadableStream } from "stream/web";
 
 const size = 128;
@@ -212,6 +213,21 @@ describe("ReadBufferStream Tests", () => {
             expect(pump.aborted).toBe(true);
             expect(stream.isComplete).toBe(true);
             expect(source.locked).toBe(false);
+        });
+
+        it("does not destroy a Node stream when destroyOnAbort is false.", async () => {
+            const source = Readable.from([new Uint8Array([1, 2, 3])]);
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(source, {
+                destroyOnAbort: false,
+                maxReadAhead: 1
+            });
+
+            await stream.ensureAvailable(1);
+            pump.abort(new Error("stop reading"));
+            await pump.finished;
+
+            expect(source.destroyed).toBe(false);
         });
     });
 });
