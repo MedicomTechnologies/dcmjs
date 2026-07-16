@@ -1,4 +1,4 @@
-import { ReadBufferStream } from "../src/BufferStream";
+import { ReadBufferStream, WriteBufferStream } from "../src/BufferStream";
 import { Readable } from "stream";
 import { ReadableStream } from "stream/web";
 
@@ -7,6 +7,32 @@ const buffer = new ArrayBuffer(size);
 const dataView = new DataView(buffer);
 for (let i = 0; i < size; i++) {
     dataView.setUint8(i, i % 256);
+}
+
+function createCountingAsyncSource(chunks) {
+    let index = 0;
+    let nextCalls = 0;
+    return {
+        source: {
+            [Symbol.asyncIterator]() {
+                return {
+                    next() {
+                        nextCalls++;
+                        if (index >= chunks.length) {
+                            return Promise.resolve({ done: true });
+                        }
+                        return Promise.resolve({
+                            done: false,
+                            value: chunks[index++]
+                        });
+                    }
+                };
+            }
+        },
+        get nextCalls() {
+            return nextCalls;
+        }
+    };
 }
 
 describe("ReadBufferStream Tests", () => {
@@ -156,9 +182,28 @@ describe("ReadBufferStream Tests", () => {
             expect(stream.isAvailable(remaining, false)).toBe(true);
             expect(stream.isAvailable(remaining + 1, false)).toBe(false);
         });
+
+        it("rechecks pending availability after reset.", async () => {
+            const stream = new ReadBufferStream(null, false);
+            stream.addBuffer(new ArrayBuffer(4));
+            stream.increment(4);
+            const available = stream.ensureAvailable(4);
+
+            stream.reset();
+
+            await expect(available).resolves.toBe(true);
+        });
     });
 
     describe("async stream pumping", () => {
+        it("rejects unsupported stream sources synchronously.", () => {
+            const stream = new ReadBufferStream(null, false);
+
+            expect(() => stream.pumpAsyncStream(new ArrayBuffer(16))).toThrow(
+                "Async stream must be an async iterable or ReadableStream"
+            );
+        });
+
         it("reads chunks from a ReadableStream source.", async () => {
             const source = new ReadableStream({
                 start(controller) {
@@ -178,9 +223,181 @@ describe("ReadBufferStream Tests", () => {
             expect(source.locked).toBe(false);
         });
 
-        it("cancels a ReadableStream source when aborted.", async () => {
-            const cancelReason = new Error("stop reading");
-            let receivedCancelReason;
+        it("retains low-level support for generic async iterables.", async () => {
+            const source = {
+                async *[Symbol.asyncIterator]() {
+                    yield new Uint8Array([1, 2]);
+                    yield new Uint8Array([3]);
+                }
+            };
+            const stream = new ReadBufferStream(null, false);
+
+            const pump = stream.pumpAsyncStream(source);
+            expect(pump.cancellable).toBe(false);
+            await pump.finished;
+            stream.reset();
+
+            expect(stream.readUint8()).toBe(1);
+            expect(stream.readUint8()).toBe(2);
+            expect(stream.readUint8()).toBe(3);
+        });
+
+        it("resumes a bounded pump as bytes are read.", async () => {
+            const countedSource = createCountingAsyncSource([
+                new Uint8Array([1, 2]),
+                new Uint8Array([3, 4])
+            ]);
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(countedSource.source, {
+                readAheadHighWaterMark: 2
+            });
+
+            await stream.ensureAvailable(2);
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect(countedSource.nextCalls).toBe(1);
+            expect(stream.readUint8()).toBe(1);
+            expect(stream.readUint8()).toBe(2);
+            await stream.ensureAvailable(2);
+            expect(countedSource.nextCalls).toBe(2);
+            expect(stream.readUint8()).toBe(3);
+            expect(stream.readUint8()).toBe(4);
+            await pump.finished;
+
+            expect(stream.isComplete).toBe(true);
+            expect(countedSource.nextCalls).toBe(3);
+        });
+
+        it("resumes a bounded pump after bulk cursor movement.", async () => {
+            const countedSource = createCountingAsyncSource([
+                new Uint8Array([1, 2, 3, 4]),
+                new Uint8Array([5, 6])
+            ]);
+            const stream = new ReadBufferStream(null, true);
+            const pump = stream.pumpAsyncStream(countedSource.source, {
+                readAheadHighWaterMark: 4
+            });
+
+            await stream.ensureAvailable(4);
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect(countedSource.nextCalls).toBe(1);
+            const values = stream.readUint16Array(4);
+            expect(Array.from(values)).toEqual([513, 1027]);
+            await stream.ensureAvailable(2);
+            expect(countedSource.nextCalls).toBe(2);
+            stream.toEnd();
+            await pump.finished;
+
+            expect(stream.isComplete).toBe(true);
+            expect(countedSource.nextCalls).toBe(3);
+        });
+
+        it("resumes a bounded pump after concat advances the cursor.", async () => {
+            const countedSource = createCountingAsyncSource([
+                new Uint8Array([1, 2, 3, 4]),
+                new Uint8Array([5, 6])
+            ]);
+            const stream = new WriteBufferStream(4, false);
+            const consumed = new WriteBufferStream(4, false);
+            consumed.writeUint8Repeat(0, 4);
+            consumed.reset();
+            const pump = stream.pumpAsyncStream(countedSource.source, {
+                readAheadHighWaterMark: 4
+            });
+
+            await stream.ensureAvailable(4);
+            await new Promise(resolve => setTimeout(resolve, 0));
+            expect(countedSource.nextCalls).toBe(1);
+
+            stream.concat(consumed);
+            await stream.ensureAvailable(2);
+
+            expect(countedSource.nextCalls).toBe(2);
+            pump.stop();
+            await pump.finished;
+        });
+
+        it("cancels a source error while the pump is waiting on read-ahead.", async () => {
+            const sourceError = new Error("source failed");
+            let hasRead = false;
+            const source = new Readable({
+                read() {
+                    if (!hasRead) {
+                        hasRead = true;
+                        this.push(new Uint8Array([1, 2]));
+                    }
+                }
+            });
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(source, {
+                readAheadHighWaterMark: 2
+            });
+
+            await stream.ensureAvailable(2);
+            source.emit("error", sourceError);
+
+            await expect(pump.failure).rejects.toBe(sourceError);
+            await expect(pump.finished).rejects.toBe(sourceError);
+        });
+
+        it("applies the read-ahead high-water mark between source chunks.", async () => {
+            const countedSource = createCountingAsyncSource([
+                new Uint8Array(8),
+                new Uint8Array(1)
+            ]);
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(countedSource.source, {
+                readAheadHighWaterMark: 2
+            });
+
+            await stream.ensureAvailable(1);
+            await new Promise(resolve => setTimeout(resolve, 0));
+
+            expect(stream.size).toBe(8);
+            expect(countedSource.nextCalls).toBe(1);
+
+            pump.stop();
+            await pump.finished;
+        });
+
+        it("cancels a Web source when chunk processing fails.", async () => {
+            let wasCancelled = false;
+            const source = new ReadableStream({
+                start(controller) {
+                    controller.enqueue("invalid chunk");
+                },
+                cancel() {
+                    wasCancelled = true;
+                }
+            });
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(source);
+
+            await expect(pump.finished).rejects.toThrow(
+                "Async stream chunks must be ArrayBuffer views"
+            );
+            expect(wasCancelled).toBe(true);
+            expect(source.locked).toBe(false);
+        });
+
+        it("normalizes reasonless source rejections.", async () => {
+            const source = {
+                [Symbol.asyncIterator]() {
+                    return {
+                        next() {
+                            return Promise.reject();
+                        }
+                    };
+                }
+            };
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(source);
+
+            await expect(pump.failure).rejects.toThrow("Async source failed");
+            await expect(pump.finished).rejects.toThrow("Async source failed");
+        });
+
+        it("cancels a ReadableStream source when stopped.", async () => {
+            let receivedStopReason;
             let resolveCancel;
             let isFinished = false;
             const source = new ReadableStream({
@@ -188,17 +405,19 @@ describe("ReadBufferStream Tests", () => {
                     controller.enqueue(new Uint8Array([1, 2, 3]));
                 },
                 cancel(reason) {
-                    receivedCancelReason = reason;
+                    receivedStopReason = reason;
                     return new Promise(resolve => {
                         resolveCancel = resolve;
                     });
                 }
             });
             const stream = new ReadBufferStream(null, false);
-            const pump = stream.pumpAsyncStream(source, { maxReadAhead: 1 });
+            const pump = stream.pumpAsyncStream(source, {
+                readAheadHighWaterMark: 1
+            });
 
             await stream.ensureAvailable(1);
-            pump.abort(cancelReason);
+            pump.stop();
             const finished = pump.finished.then(() => {
                 isFinished = true;
             });
@@ -209,25 +428,30 @@ describe("ReadBufferStream Tests", () => {
             resolveCancel();
             await finished;
 
-            expect(receivedCancelReason).toBe(cancelReason);
-            expect(pump.aborted).toBe(true);
+            expect(receivedStopReason).toBeInstanceOf(Error);
+            expect(pump.aborted).toBe(false);
+            expect(pump.stopped).toBe(true);
             expect(stream.isComplete).toBe(true);
             expect(source.locked).toBe(false);
         });
 
-        it("does not destroy a Node stream when destroyOnAbort is false.", async () => {
-            const source = Readable.from([new Uint8Array([1, 2, 3])]);
+        it("rejects when aborted by an external error.", async () => {
+            const source = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new Uint8Array([1, 2, 3]));
+                }
+            });
             const stream = new ReadBufferStream(null, false);
             const pump = stream.pumpAsyncStream(source, {
-                destroyOnAbort: false,
-                maxReadAhead: 1
+                readAheadHighWaterMark: 1
             });
+            const externalError = new Error("storage failed");
 
             await stream.ensureAvailable(1);
-            pump.abort(new Error("stop reading"));
-            await pump.finished;
+            pump.abort(externalError);
 
-            expect(source.destroyed).toBe(false);
+            await expect(pump.finished).rejects.toBe(externalError);
+            expect(pump.aborted).toBe(true);
         });
     });
 });
