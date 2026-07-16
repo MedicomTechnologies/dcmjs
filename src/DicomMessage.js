@@ -49,7 +49,8 @@ export class DicomMessage {
             this._normalizeReadOptions({
                 untilTag: untilTag,
                 includeUntilTagValue: includeUntilTagValue
-            })
+            }),
+            true
         );
     }
 
@@ -73,7 +74,8 @@ export class DicomMessage {
                 const readInfo = DicomMessage._readTag(
                     bufferStream,
                     syntax,
-                    options
+                    options,
+                    true
                 );
                 const cleanTagString = readInfo.tag.toCleanString();
                 if (untilTag && stopOnGreaterTag && cleanTagString > untilTag) {
@@ -170,7 +172,7 @@ export class DicomMessage {
         var metaStartPos = stream.offset;
 
         // read the first tag to check if it's the meta length tag
-        var el = DicomMessage._readTag(stream, useSyntax);
+        var el = DicomMessage._readTag(stream, useSyntax, undefined, true);
 
         var metaHeader = {};
         if (el.tag.cleanString !== TagHex.FileMetaInformationGroupLength) {
@@ -296,8 +298,12 @@ export class DicomMessage {
         options = {
             untilTag: null,
             includeUntilTagValue: false
-        }
+        },
+        optionsAreNormalized = false
     ) {
+        if (!optionsAreNormalized) {
+            options = DicomMessage._normalizeReadOptions(options);
+        }
         const { untilTag, includeUntilTagValue } = options;
         var implicit = syntax == IMPLICIT_LITTLE_ENDIAN ? true : false,
             isLittleEndian =

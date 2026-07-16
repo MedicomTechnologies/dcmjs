@@ -116,12 +116,19 @@ const source = fs.createReadStream("image.dcm");
 
 const result = await reader.readFileFromAsyncStream(source, {
     untilTag: TagHex.PixelData,
-    includeUntilTagValue: false
+    includeUntilTagValue: false,
+    streamOptions: {
+        readAheadHighWaterMark: 64 * 1024
+    }
 });
 
 console.log(result.dict);
 console.log(result.stopInfo);
 ```
+
+`readAheadHighWaterMark` applies between source chunks. A single incoming
+chunk is added atomically, so retained bytes may exceed the mark by up to one
+source chunk.
 
 The same API accepts a browser response body:
 

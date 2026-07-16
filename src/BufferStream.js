@@ -270,7 +270,7 @@ export class BufferStream {
             i = 0;
         while (i++ < sixlen) {
             arr[i] = this.view.getUint16(this.offset, this.isLittleEndian);
-            this.offset += 2;
+            this.increment(2);
         }
         return arr;
     }
@@ -372,6 +372,9 @@ export class BufferStream {
         if (this.offset > this.size) {
             this.size = this.offset;
         }
+        if (this.readAheadListeners.length > 0) {
+            this.notifyReadAheadListeners();
+        }
         return step;
     }
 
@@ -393,37 +396,64 @@ export class BufferStream {
                 "Cancellable stream must be a Node stream or ReadableStream"
             );
         }
+        let rejectFailure;
+        let resolveStop;
+        const failure = new Promise((_resolve, reject) => {
+            rejectFailure = reject;
+        });
+        failure.catch(() => {});
+        const stopSignal = new Promise(resolve => {
+            resolveStop = resolve;
+        });
         const state = {
+            cancelRequested: false,
             cancelPromise: Promise.resolve(),
             failure: undefined,
             settled: false,
+            stopSignal,
             stopped: false
         };
 
-        const cancel = failure => {
-            if (state.stopped || state.settled) {
+        const reportFailure = error => {
+            if (state.failure) {
                 return;
             }
-            state.failure = failure;
+            state.failure = error;
+            rejectFailure(error);
+            this.setFailed(error);
+        };
+
+        const cancel = error => {
+            if (error) {
+                reportFailure(error);
+            }
+            if (state.cancelRequested || state.settled) {
+                return;
+            }
+            state.cancelRequested = true;
             state.stopped = true;
-            const cancelSource = failure ? source.abort : source.stop;
-            const reason = failure ?? BufferStream.createStopReason();
+            resolveStop();
+            const cancelSource = error ? source.abort : source.stop;
+            const reason = error ?? BufferStream.createStopReason();
             state.cancelPromise = BufferStream.cancelSource(
                 cancelSource,
                 reason
             );
-            if (failure) {
-                this.setFailed(failure);
-            } else {
+            if (!error) {
                 this.setComplete();
             }
         };
+        state.cancel = cancel;
+        state.reportFailure = reportFailure;
+        state.removeErrorListener = source.onError?.(cancel);
 
         const finished = this._pumpAsyncStream(source, state, options);
         finished.catch(() => {});
 
         return {
             abort: error => cancel(BufferStream.toError(error)),
+            cancellable: source.cancellable,
+            failure,
             finished,
             stop: () => cancel(),
             get aborted() {
@@ -439,34 +469,47 @@ export class BufferStream {
     }
 
     async _pumpAsyncStream(source, state, options) {
-        let cancellationError;
-        let sourceError;
         try {
             while (!state.stopped) {
-                const { done, value } = await source.next();
-                if (done || state.stopped) {
+                const next = Promise.resolve()
+                    .then(() => source.next())
+                    .then(result => ({ result }));
+                const nextResult = await Promise.race([next, state.stopSignal]);
+                if (!nextResult || state.stopped) {
+                    break;
+                }
+                const { done, value } = nextResult.result;
+                if (done) {
                     break;
                 }
                 this.addBuffer(BufferStream.arrayBufferFromChunk(value));
-                await this.waitForReadAhead(options.maxReadAhead, state);
+                await this.waitForReadAhead(
+                    options.readAheadHighWaterMark,
+                    state
+                );
             }
         } catch (error) {
-            if (error !== state.failure) {
-                sourceError = error;
+            const expectedStopError =
+                state.stopped &&
+                !state.failure &&
+                source.isExpectedStopError?.(error);
+            if (!expectedStopError && error !== state.failure) {
+                state.cancel(error);
             }
         } finally {
             try {
                 await state.cancelPromise;
             } catch (error) {
-                cancellationError = error;
+                state.reportFailure(error);
             } finally {
-                source.release?.();
+                try {
+                    source.release?.();
+                } catch (error) {
+                    state.reportFailure(error);
+                }
+                state.removeErrorListener?.();
                 state.settled = true;
-                const failure =
-                    state.failure || sourceError || cancellationError;
-                if (failure) {
-                    this.setFailed(failure);
-                } else {
+                if (!state.failure) {
                     this.setComplete();
                 }
             }
@@ -474,12 +517,6 @@ export class BufferStream {
 
         if (state.failure) {
             throw state.failure;
-        }
-        if (sourceError) {
-            throw sourceError;
-        }
-        if (cancellationError) {
-            throw cancellationError;
         }
     }
 
@@ -502,6 +539,61 @@ export class BufferStream {
         }
     }
 
+    static destroyNodeStream(stream, reason) {
+        if (
+            typeof stream.once !== "function" ||
+            typeof stream.off !== "function"
+        ) {
+            stream.destroy(reason);
+            return Promise.resolve();
+        }
+        if (stream.closed) {
+            return Promise.resolve();
+        }
+
+        return new Promise((resolve, reject) => {
+            let destroyError;
+            let isSettled = false;
+            let waitTimer;
+            const cleanup = () => {
+                clearTimeout(waitTimer);
+                stream.off("close", onClose);
+                stream.off("error", onError);
+            };
+            const settle = () => {
+                if (isSettled) {
+                    return;
+                }
+                isSettled = true;
+                cleanup();
+                destroyError ? reject(destroyError) : resolve();
+            };
+            const onError = error => {
+                destroyError ||= error;
+            };
+            const onClose = () => settle();
+            const waitForClosed = () => {
+                if (stream.closed) {
+                    waitTimer = setTimeout(settle, 0);
+                } else {
+                    waitTimer = setTimeout(waitForClosed, 0);
+                }
+            };
+
+            stream.once("close", onClose);
+            stream.on("error", onError);
+            try {
+                stream.destroy(reason);
+                if (stream._readableState?.emitClose === false) {
+                    waitForClosed();
+                }
+            } catch (error) {
+                destroyError ||= error;
+                settle();
+            }
+        });
+    }
+
     static asyncSourceFromStream(stream) {
         if (typeof stream?.getReader === "function") {
             const reader = stream.getReader();
@@ -517,14 +609,33 @@ export class BufferStream {
         const iterator = stream?.[Symbol.asyncIterator]?.();
         if (iterator) {
             const hasDestroy = typeof stream.destroy === "function";
-            const canStop = typeof iterator.return === "function";
+            const canObserveClose =
+                typeof stream.once === "function" &&
+                typeof stream.off === "function";
             return {
-                cancellable: hasDestroy && canStop,
+                cancellable: hasDestroy && canObserveClose,
                 next: () => iterator.next(),
                 abort: hasDestroy
-                    ? reason => stream.destroy(reason)
+                    ? reason => BufferStream.destroyNodeStream(stream, reason)
                     : reason => iterator.return?.(reason),
-                stop: canStop ? () => iterator.return() : undefined
+                stop: hasDestroy
+                    ? () => BufferStream.destroyNodeStream(stream)
+                    : () => iterator.return?.(),
+                onError:
+                    typeof stream.on === "function" &&
+                    typeof stream.off === "function"
+                        ? handler => {
+                              stream.on("error", handler);
+                              return () => stream.off("error", handler);
+                          }
+                        : undefined,
+                isExpectedStopError: hasDestroy
+                    ? error =>
+                          error?.name === "AbortError" ||
+                          error?.code === "ABORT_ERR" ||
+                          error?.code === "ERR_STREAM_PREMATURE_CLOSE" ||
+                          error?.message === "Premature close"
+                    : undefined
             };
         }
 
@@ -545,25 +656,28 @@ export class BufferStream {
         }
         throw new TypeError("Async stream chunks must be ArrayBuffer views");
     }
-    async waitForReadAhead(maxReadAhead, state) {
-        if (typeof maxReadAhead !== "number") {
+    async waitForReadAhead(readAheadHighWaterMark, state) {
+        if (typeof readAheadHighWaterMark !== "number") {
             return;
         }
 
-        while (!state.stopped && this.isPastReadAheadLimit(maxReadAhead)) {
+        while (
+            !state.stopped &&
+            this.isPastReadAheadLimit(readAheadHighWaterMark)
+        ) {
             await new Promise(resolve => {
                 this.readAheadListeners.push(resolve);
             });
         }
     }
 
-    isPastReadAheadLimit(maxReadAhead) {
-        const limit = this.readAheadLimit(maxReadAhead);
+    isPastReadAheadLimit(readAheadHighWaterMark) {
+        const limit = this.readAheadLimit(readAheadHighWaterMark);
         return limit === 0 ? this.available > 0 : this.available >= limit;
     }
 
-    readAheadLimit(maxReadAhead) {
-        return Math.max(0, maxReadAhead, this.requestedAvailable);
+    readAheadLimit(readAheadHighWaterMark) {
+        return Math.max(0, readAheadHighWaterMark, this.requestedAvailable);
     }
 
     /**
@@ -611,7 +725,6 @@ export class BufferStream {
      * The default offset is the current position, so everything already read.
      */
     consume(offset = this.offset) {
-        this.notifyReadAheadListeners();
         if (!this.clearBuffers) {
             return;
         }
@@ -655,7 +768,7 @@ export class BufferStream {
     }
 
     toEnd() {
-        this.offset = this.view.byteLength;
+        this.increment(this.view.byteLength - this.offset);
     }
 
     /**
@@ -713,7 +826,7 @@ export class ReadBufferStream extends BufferStream {
     }
 
     toEnd() {
-        this.offset = this.endOffset;
+        this.increment(this.endOffset - this.offset);
     }
 
     writeUint8(value) {

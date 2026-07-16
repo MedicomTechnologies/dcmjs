@@ -49,14 +49,14 @@ export class AsyncDicomReader {
 
     static async readFileFromAsyncStream(stream, options = {}) {
         const { readerOptions, ...readOptions } = options;
-        const reader = new AsyncDicomReader(readerOptions);
+        const reader = new this(readerOptions);
         return reader.readFileFromAsyncStream(stream, readOptions);
     }
 
     async readFileFromAsyncStream(stream, options = {}) {
         const { streamOptions: inputStreamOptions, ...readOptions } = options;
         const streamOptions = {
-            maxReadAhead: 1024,
+            readAheadHighWaterMark: 1024,
             ...inputStreamOptions,
             requireCancellation: true
         };
@@ -64,6 +64,8 @@ export class AsyncDicomReader {
         const pump = this.stream.pumpAsyncStream(stream, streamOptions);
         this.pump = {
             abort: pump.abort,
+            cancellable: pump.cancellable,
+            failure: pump.failure,
             finished: pump.finished,
             get aborted() {
                 return pump.aborted;
@@ -72,15 +74,10 @@ export class AsyncDicomReader {
                 return pump.reason;
             }
         };
-        const pumpFailure = pump.finished.then(
-            () => new Promise(() => {}),
-            error => Promise.reject(error)
-        );
-
         try {
             const result = await Promise.race([
                 this.readFile(readOptions),
-                pumpFailure
+                pump.failure
             ]);
             pump.stop();
             await pump.finished;
@@ -271,7 +268,7 @@ export class AsyncDicomReader {
         const { stream } = this;
         await stream.ensureAvailable(12);
         const { offset: metaStartPos } = stream;
-        const el = this.readTagHeader();
+        const el = this.readTagHeader(undefined, true);
         if (el.tag !== TagHex.FileMetaInformationGroupLength) {
             // meta length tag is missing
             if (!options?.ignoreErrors) {
@@ -328,7 +325,7 @@ export class AsyncDicomReader {
             // Consume before reading the tag so that data before the
             // current tag can be cleared.
             stream.consume();
-            const tagInfo = this.readTagHeader(options);
+            const tagInfo = this.readTagHeader(options, true);
 
             if (tagInfo.isPastUntilTag) {
                 stream.offset = tagInfo.tagStartOffset;
@@ -423,7 +420,8 @@ export class AsyncDicomReader {
             valueOffset: tagInfo.valueOffset,
             valueLength: tagInfo.length,
             stopOffset: this.stream.offset,
-            bufferedSize: this.stream.size
+            availableBytes: this.stream.available,
+            loadedEndOffset: this.stream.endOffset
         };
         return this.stopInfo;
     }
@@ -441,7 +439,7 @@ export class AsyncDicomReader {
             (await stream.ensureAvailable(12))
         ) {
             readLog.debug("readSequence loop", stream.offset, endOffset);
-            const tagInfo = this.readTagHeader();
+            const tagInfo = this.readTagHeader(undefined, true);
             const { tag } = tagInfo;
             if (tag === TagHex.Item) {
                 listener.startObject();
@@ -548,7 +546,7 @@ export class AsyncDicomReader {
             readLog.debug("readCompressed frame loop", frameNumber);
             stream.consume();
             await stream.ensureAvailable();
-            const frameTag = this.readTagHeader();
+            const frameTag = this.readTagHeader(undefined, true);
             if (frameTag.tag === TagHex.SequenceDelimitationEnd) {
                 if (lastFrame) {
                     // Always deliver frames as arrays, using streaming splitFrame
@@ -578,7 +576,7 @@ export class AsyncDicomReader {
     }
 
     async readOffsets() {
-        const tagInfo = this.readTagHeader();
+        const tagInfo = this.readTagHeader(undefined, true);
         if (tagInfo.tag !== TagHex.Item) {
             throw new Error(`Offsets tag is missing: ${tagInfo.tag}`);
         }
@@ -772,8 +770,12 @@ export class AsyncDicomReader {
         options = {
             untilTag: null,
             includeUntilTagValue: false
-        }
+        },
+        optionsAreNormalized = false
     ) {
+        if (!optionsAreNormalized) {
+            options = this.normalizeReadOptions(options);
+        }
         const { stream, syntax } = this;
         const { untilTag, includeUntilTagValue } = options;
         const implicit = syntax == IMPLICIT_LITTLE_ENDIAN;
