@@ -98,6 +98,62 @@ async function readWithCustomListener(arrayBuffer) {
 }
 ```
 
+### Reading Metadata from a Cancellable Stream
+
+`readFileFromAsyncStream()` accepts Node readable streams and browser
+`ReadableStream` sources. It owns the source lifecycle and stops the source
+when parsing completes or reaches an early-stop condition.
+
+```javascript
+import fs from "node:fs";
+import dcmjs from "dcmjs";
+
+const { AsyncDicomReader } = dcmjs.async;
+const { TagHex } = dcmjs.constants;
+
+const reader = new AsyncDicomReader();
+const source = fs.createReadStream("image.dcm");
+
+const result = await reader.readFileFromAsyncStream(source, {
+    untilTag: TagHex.PixelData,
+    includeUntilTagValue: false
+});
+
+console.log(result.dict);
+console.log(result.stopInfo);
+```
+
+The same API accepts a browser response body:
+
+```javascript
+const response = await fetch("/image.dcm");
+const reader = await AsyncDicomReader.readFileFromAsyncStream(response.body, {
+    untilTag: "7FE00010"
+});
+```
+
+The exposed pump distinguishes successful parser completion from external
+processing failure. The reader stops its source successfully after an
+`untilTag`, `stopOnGreaterTag`, or `shouldStop` match. An external workflow,
+such as a STOW handler, can reject the read with its own error:
+
+```javascript
+const readPromise = reader.readFileFromAsyncStream(source, options);
+
+try {
+    await processIncomingRequest();
+} catch (error) {
+    reader.pump.abort(error);
+}
+
+await readPromise; // rejects with the external error
+```
+
+Generic async iterables remain supported by the lower-level
+`reader.stream.fromAsyncStream()` API. They are not accepted by
+`readFileFromAsyncStream()` because the async iterator protocol does not
+guarantee that `return()` interrupts a pending `next()` call.
+
 ## Architecture
 
 ### Core Components

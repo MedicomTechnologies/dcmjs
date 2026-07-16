@@ -1,5 +1,4 @@
 import { ReadBufferStream } from "../src/BufferStream";
-import { Readable } from "stream";
 import { ReadableStream } from "stream/web";
 
 const size = 128;
@@ -159,6 +158,14 @@ describe("ReadBufferStream Tests", () => {
     });
 
     describe("async stream pumping", () => {
+        it("rejects unsupported stream sources synchronously.", () => {
+            const stream = new ReadBufferStream(null, false);
+
+            expect(() => stream.pumpAsyncStream(new ArrayBuffer(16))).toThrow(
+                "Async stream must be an async iterable or ReadableStream"
+            );
+        });
+
         it("reads chunks from a ReadableStream source.", async () => {
             const source = new ReadableStream({
                 start(controller) {
@@ -178,9 +185,25 @@ describe("ReadBufferStream Tests", () => {
             expect(source.locked).toBe(false);
         });
 
-        it("cancels a ReadableStream source when aborted.", async () => {
-            const cancelReason = new Error("stop reading");
-            let receivedCancelReason;
+        it("retains low-level support for generic async iterables.", async () => {
+            const source = {
+                async *[Symbol.asyncIterator]() {
+                    yield new Uint8Array([1, 2]);
+                    yield new Uint8Array([3]);
+                }
+            };
+            const stream = new ReadBufferStream(null, false);
+
+            await stream.fromAsyncStream(source);
+            stream.reset();
+
+            expect(stream.readUint8()).toBe(1);
+            expect(stream.readUint8()).toBe(2);
+            expect(stream.readUint8()).toBe(3);
+        });
+
+        it("cancels a ReadableStream source when stopped.", async () => {
+            let receivedStopReason;
             let resolveCancel;
             let isFinished = false;
             const source = new ReadableStream({
@@ -188,7 +211,7 @@ describe("ReadBufferStream Tests", () => {
                     controller.enqueue(new Uint8Array([1, 2, 3]));
                 },
                 cancel(reason) {
-                    receivedCancelReason = reason;
+                    receivedStopReason = reason;
                     return new Promise(resolve => {
                         resolveCancel = resolve;
                     });
@@ -198,7 +221,7 @@ describe("ReadBufferStream Tests", () => {
             const pump = stream.pumpAsyncStream(source, { maxReadAhead: 1 });
 
             await stream.ensureAvailable(1);
-            pump.abort(cancelReason);
+            pump.stop();
             const finished = pump.finished.then(() => {
                 isFinished = true;
             });
@@ -209,25 +232,28 @@ describe("ReadBufferStream Tests", () => {
             resolveCancel();
             await finished;
 
-            expect(receivedCancelReason).toBe(cancelReason);
-            expect(pump.aborted).toBe(true);
+            expect(receivedStopReason).toBeInstanceOf(Error);
+            expect(pump.aborted).toBe(false);
+            expect(pump.stopped).toBe(true);
             expect(stream.isComplete).toBe(true);
             expect(source.locked).toBe(false);
         });
 
-        it("does not destroy a Node stream when destroyOnAbort is false.", async () => {
-            const source = Readable.from([new Uint8Array([1, 2, 3])]);
-            const stream = new ReadBufferStream(null, false);
-            const pump = stream.pumpAsyncStream(source, {
-                destroyOnAbort: false,
-                maxReadAhead: 1
+        it("rejects when aborted by an external error.", async () => {
+            const source = new ReadableStream({
+                start(controller) {
+                    controller.enqueue(new Uint8Array([1, 2, 3]));
+                }
             });
+            const stream = new ReadBufferStream(null, false);
+            const pump = stream.pumpAsyncStream(source, { maxReadAhead: 1 });
+            const externalError = new Error("storage failed");
 
             await stream.ensureAvailable(1);
-            pump.abort(new Error("stop reading"));
-            await pump.finished;
+            pump.abort(externalError);
 
-            expect(source.destroyed).toBe(false);
+            await expect(pump.finished).rejects.toBe(externalError);
+            expect(pump.aborted).toBe(true);
         });
     });
 });

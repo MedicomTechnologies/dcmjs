@@ -18,6 +18,7 @@ import { deepEqual } from "./utilities/deepEqual";
 import { ValueRepresentation } from "./ValueRepresentation.js";
 
 export const singleVRs = ["SQ", "OF", "OW", "OB", "UN", "LT"];
+const NORMALIZED_READ_OPTIONS = Symbol("normalizedReadOptions");
 
 export class DicomMessage {
     static read(
@@ -214,13 +215,21 @@ export class DicomMessage {
     }
 
     static _normalizeReadOptions(options = {}) {
-        return {
+        options ||= {};
+        if (options[NORMALIZED_READ_OPTIONS]) {
+            return options;
+        }
+        const normalizedOptions = {
             ...options,
             untilTag: DicomMetaDictionary.normalizeTagOption(
                 options.untilTag,
                 "untilTag"
             )
         };
+        Object.defineProperty(normalizedOptions, NORMALIZED_READ_OPTIONS, {
+            value: true
+        });
+        return normalizedOptions;
     }
 
     static writeTagObject(stream, tagString, vr, values, syntax, writeOptions) {

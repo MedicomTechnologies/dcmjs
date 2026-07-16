@@ -19,6 +19,7 @@ import { DicomMetadataListener } from "./utilities/DicomMetadataListener.js";
 import { log } from "./log.js";
 
 const readLog = log.getLogger("AsyncDicomReader");
+const NORMALIZED_READ_OPTIONS = Symbol("normalizedReadOptions");
 
 /**
  * This is an asynchronous binary DICOM reader.
@@ -31,6 +32,7 @@ const readLog = log.getLogger("AsyncDicomReader");
 export class AsyncDicomReader {
     syntax = EXPLICIT_LITTLE_ENDIAN;
     stopInfo = null;
+    pump = null;
 
     constructor(options = {}) {
         this.isLittleEndian = options?.isLittleEndian;
@@ -52,59 +54,45 @@ export class AsyncDicomReader {
     }
 
     async readFileFromAsyncStream(stream, options = {}) {
-        const {
-            streamOptions: inputStreamOptions,
-            stopStreamOnComplete = true,
-            ...readOptions
-        } = options;
+        const { streamOptions: inputStreamOptions, ...readOptions } = options;
         const streamOptions = {
             maxReadAhead: 1024,
-            ...inputStreamOptions
+            ...inputStreamOptions,
+            requireCancellation: true
         };
 
         const pump = this.stream.pumpAsyncStream(stream, streamOptions);
-        const awaitAbort = this.shouldAwaitStreamAbort(stream, streamOptions);
+        this.pump = {
+            abort: pump.abort,
+            finished: pump.finished,
+            get aborted() {
+                return pump.aborted;
+            },
+            get reason() {
+                return pump.reason;
+            }
+        };
+        const pumpFailure = pump.finished.then(
+            () => new Promise(() => {}),
+            error => Promise.reject(error)
+        );
 
         try {
-            const result = await this.readFile(readOptions);
-            if (stopStreamOnComplete) {
-                pump.abort();
-                await this.settlePumpAfterAbort(pump, awaitAbort);
-            }
+            const result = await Promise.race([
+                this.readFile(readOptions),
+                pumpFailure
+            ]);
+            pump.stop();
+            await pump.finished;
             return result;
         } catch (error) {
             pump.abort(error);
-            await this.settlePumpAfterAbort(pump, awaitAbort);
-            throw error;
-        }
-    }
-
-    shouldAwaitStreamAbort(stream, streamOptions) {
-        if (streamOptions.awaitAbort !== undefined) {
-            return streamOptions.awaitAbort;
-        }
-        return (
-            streamOptions.cancelOnAbort !== false &&
-            (typeof stream.destroy === "function" ||
-                typeof stream.getReader === "function")
-        );
-    }
-
-    async settlePumpAfterAbort(pump, shouldAwait) {
-        const finished = pump.finished.catch(error => {
-            if (
-                pump.aborted &&
-                ReadBufferStream.isAbortError(error, pump.reason)
-            ) {
-                return;
+            try {
+                await pump.finished;
+            } catch {
+                // Preserve the parsing, source, or externally supplied error.
             }
             throw error;
-        });
-
-        if (shouldAwait) {
-            await finished;
-        } else {
-            finished.catch(() => {});
         }
     }
 
@@ -214,6 +202,7 @@ export class AsyncDicomReader {
     }
 
     async readFile(options = undefined) {
+        options = this.normalizeReadOptions(options);
         this.stopInfo = null;
         const hasPreamble = await this.readPreamble();
         if (hasPreamble === AsyncDicomReader.PART10_NO_PREAMBLE) {
@@ -322,6 +311,7 @@ export class AsyncDicomReader {
     }
 
     async read(listener, options) {
+        options = this.normalizeReadOptions(options);
         const untilOffset = options?.untilOffset || Number.MAX_SAFE_INTEGER;
         this.listener = listener;
         const { stream } = this;
@@ -394,6 +384,11 @@ export class AsyncDicomReader {
     }
 
     async shouldStopAfterTag(tagInfo, listener, options) {
+        if (options?.includeUntilTagValue && options.untilTag === tagInfo.tag) {
+            this.setStopInfo("untilTag", tagInfo);
+            return true;
+        }
+
         const { shouldStop } = options || {};
         if (typeof shouldStop !== "function") {
             return false;
@@ -459,6 +454,7 @@ export class AsyncDicomReader {
                     ...options,
                     untilTag: null,
                     includeUntilTagValue: false,
+                    shouldStop: undefined,
                     stopOnGreaterTag: false,
                     untilOffset: itemUntilOffset
                 };
@@ -746,13 +742,21 @@ export class AsyncDicomReader {
     }
 
     normalizeReadOptions(options = {}) {
-        return {
+        options ||= {};
+        if (options[NORMALIZED_READ_OPTIONS]) {
+            return options;
+        }
+        const normalizedOptions = {
             ...options,
             untilTag: DicomMetaDictionary.normalizeTagOption(
                 options.untilTag,
                 "untilTag"
             )
         };
+        Object.defineProperty(normalizedOptions, NORMALIZED_READ_OPTIONS, {
+            value: true
+        });
+        return normalizedOptions;
     }
 
     /**
