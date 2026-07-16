@@ -372,7 +372,6 @@ export class BufferStream {
         if (this.offset > this.size) {
             this.size = this.offset;
         }
-        this.notifyReadAheadListeners();
         return step;
     }
 
@@ -612,6 +611,7 @@ export class BufferStream {
      * The default offset is the current position, so everything already read.
      */
     consume(offset = this.offset) {
+        this.notifyReadAheadListeners();
         if (!this.clearBuffers) {
             return;
         }

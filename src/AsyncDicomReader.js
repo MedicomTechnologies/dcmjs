@@ -313,6 +313,9 @@ export class AsyncDicomReader {
     async read(listener, options) {
         options = this.normalizeReadOptions(options);
         const untilOffset = options?.untilOffset || Number.MAX_SAFE_INTEGER;
+        const checksAfterTag =
+            options.includeUntilTagValue ||
+            typeof options.shouldStop === "function";
         this.listener = listener;
         const { stream } = this;
         await stream.ensureAvailable(12);
@@ -375,7 +378,10 @@ export class AsyncDicomReader {
             if (this.stopInfo) {
                 break;
             }
-            if (await this.shouldStopAfterTag(tagInfo, listener, options)) {
+            if (
+                checksAfterTag &&
+                (await this.shouldStopAfterTag(tagInfo, listener, options))
+            ) {
                 break;
             }
             await this.stream.ensureAvailable(12);
@@ -768,7 +774,6 @@ export class AsyncDicomReader {
             includeUntilTagValue: false
         }
     ) {
-        options = this.normalizeReadOptions(options);
         const { stream, syntax } = this;
         const { untilTag, includeUntilTagValue } = options;
         const implicit = syntax == IMPLICIT_LITTLE_ENDIAN;

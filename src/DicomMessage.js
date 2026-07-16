@@ -43,10 +43,14 @@ export class DicomMessage {
         includeUntilTagValue = false
     ) {
         log.warn("DicomMessage.readTag to be deprecated after dcmjs 0.24.x");
-        return this._readTag(bufferStream, syntax, {
-            untilTag: untilTag,
-            includeUntilTagValue: includeUntilTagValue
-        });
+        return this._readTag(
+            bufferStream,
+            syntax,
+            this._normalizeReadOptions({
+                untilTag: untilTag,
+                includeUntilTagValue: includeUntilTagValue
+            })
+        );
     }
 
     static _read(
@@ -294,7 +298,6 @@ export class DicomMessage {
             includeUntilTagValue: false
         }
     ) {
-        options = DicomMessage._normalizeReadOptions(options);
         const { untilTag, includeUntilTagValue } = options;
         var implicit = syntax == IMPLICIT_LITTLE_ENDIAN ? true : false,
             isLittleEndian =
