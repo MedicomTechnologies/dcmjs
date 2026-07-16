@@ -55,14 +55,23 @@ describe("AsyncDicomReader", () => {
         await expect(
             reader.readFileFromAsyncStream(new ArrayBuffer(16))
         ).rejects.toThrow(
-            "Async stream must be an async iterable or ReadableStream"
+            "Cancellable stream must be a Node stream or ReadableStream"
         );
     });
 
     it("rejects non-cancellable async iterables.", async () => {
+        let iteratorAcquisitions = 0;
         const source = {
-            async *[Symbol.asyncIterator]() {
-                yield new Uint8Array([1, 2, 3]);
+            [Symbol.asyncIterator]() {
+                iteratorAcquisitions++;
+                return {
+                    next() {
+                        return Promise.resolve({
+                            done: false,
+                            value: new Uint8Array([1, 2, 3])
+                        });
+                    }
+                };
             }
         };
         const reader = new AsyncDicomReader();
@@ -70,6 +79,30 @@ describe("AsyncDicomReader", () => {
         await expect(reader.readFileFromAsyncStream(source)).rejects.toThrow(
             "Cancellable stream must be a Node stream or ReadableStream"
         );
+        expect(iteratorAcquisitions).toBe(0);
+    });
+
+    it("rejects Node-like sources missing error observation.", async () => {
+        let iteratorAcquisitions = 0;
+        const source = {
+            destroy() {},
+            off() {},
+            once() {},
+            [Symbol.asyncIterator]() {
+                iteratorAcquisitions++;
+                return {
+                    next() {
+                        return new Promise(() => {});
+                    }
+                };
+            }
+        };
+        const reader = new AsyncDicomReader();
+
+        await expect(reader.readFileFromAsyncStream(source)).rejects.toThrow(
+            "Cancellable stream must be a Node stream or ReadableStream"
+        );
+        expect(iteratorAcquisitions).toBe(0);
     });
 
     it("preserves subclasses in the static stream factory.", async () => {
@@ -108,6 +141,22 @@ describe("AsyncDicomReader", () => {
 
         expect(tagInfo.isUntilTag).toBe(true);
         expect(tagInfo.tag).toBe(TagHex.PixelData);
+    });
+
+    it("rewinds direct readTagHeader calls that pass untilTag.", () => {
+        const rowsTag = new Uint8Array([0x28, 0x00, 0x10, 0x00]);
+        const reader = new AsyncDicomReader();
+        reader.stream.addBuffer(rowsTag.buffer);
+        reader.stream.setComplete();
+
+        const tagInfo = reader.readTagHeader({
+            untilTag: "00280009",
+            stopOnGreaterTag: true
+        });
+
+        expect(tagInfo.isPastUntilTag).toBe(true);
+        expect(tagInfo.stopOffset).toBe(0);
+        expect(reader.stream.offset).toBe(0);
     });
 
     it("stops a node stream before reading pixel data when untilTag matches.", async () => {

@@ -146,15 +146,17 @@ such as a STOW handler, can reject the read with its own error:
 
 ```javascript
 const readPromise = reader.readFileFromAsyncStream(source, options);
-
-try {
-    await processIncomingRequest();
-} catch (error) {
+const processingPromise = processIncomingRequest().catch(error => {
     reader.pump.abort(error);
-}
+    throw error;
+});
 
-await readPromise; // rejects with the external error
+await Promise.all([readPromise, processingPromise]);
 ```
+
+`pump.abort(error)` rejects a read that is still pending. It cannot change the
+state of a read promise that has already fulfilled, so the processing promise
+must also be awaited as shown above.
 
 Generic async iterables remain supported by the lower-level
 `reader.stream.fromAsyncStream()` API. They are not accepted by
@@ -465,6 +467,20 @@ Reads the entire DICOM file including meta information and dataset.
 
 **Returns:** `Promise<AsyncDicomReader>` - The reader instance
 
+#### `async readFileFromAsyncStream(stream, options)`
+Reads a DICOM file from a cancellable Node stream or browser
+`ReadableStream`. The source is stopped after parsing completes or reaches an
+early-stop condition.
+
+**Options:**
+- All `readFile()` options
+- `streamOptions.readAheadHighWaterMark` (number): Pause source reads between
+  chunks when unread bytes reach this threshold
+- `readerOptions` (Object, static factory only): Options for the reader
+  constructor
+
+**Returns:** `Promise<AsyncDicomReader>` - The reader instance
+
 #### `async readMeta(options)`
 Reads only the file meta information (Group 0x0002).
 
@@ -510,6 +526,10 @@ Reads a single tag header (tag, VR, length).
 - `dict` (Object): Dataset dictionary
 - `stream` (ReadBufferStream): Underlying buffer stream
 - `listener` (DicomMetadataListener): Current listener instance
+- `pump` (Object): Active stream handle exposing `abort(error)`, `failure`,
+  and `finished`
+- `stopInfo` (Object): Early-stop reason, tag/value offsets, available bytes,
+  and loaded end offset
 
 ## Common Patterns
 
@@ -783,7 +803,6 @@ The AsyncDicomReader is marked as preliminary. Future versions may include:
 - Files without DICM preamble
 - Improved streaming for network sources
 - Progress callbacks
-- Cancelable operations
 - More robust error recovery
 
 ## References

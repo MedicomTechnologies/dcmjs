@@ -328,7 +328,6 @@ export class AsyncDicomReader {
             const tagInfo = this.readTagHeader(options, true);
 
             if (tagInfo.isPastUntilTag) {
-                stream.offset = tagInfo.tagStartOffset;
                 this.setStopInfo("stopOnGreaterTag", tagInfo);
                 break;
             }
@@ -800,6 +799,7 @@ export class AsyncDicomReader {
         }
 
         if (untilTag && options.stopOnGreaterTag && tag > untilTag) {
+            stream.increment(tagStartOffset - stream.offset);
             return {
                 tag,
                 tagObj,
@@ -807,7 +807,7 @@ export class AsyncDicomReader {
                 values: 0,
                 isPastUntilTag: true,
                 tagStartOffset,
-                stopOffset: tagStartOffset
+                stopOffset: stream.offset
             };
         }
 

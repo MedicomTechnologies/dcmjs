@@ -266,9 +266,8 @@ export class BufferStream {
 
     readUint16Array(length) {
         var sixlen = length / 2,
-            arr = new Uint16Array(sixlen),
-            i = 0;
-        while (i++ < sixlen) {
+            arr = new Uint16Array(sixlen);
+        for (let i = 0; i < sixlen; i++) {
             arr[i] = this.view.getUint16(this.offset, this.isLittleEndian);
             this.increment(2);
         }
@@ -361,7 +360,7 @@ export class BufferStream {
             new Uint8Array(stream.slice(stream.startOffset, stream.size)),
             this.offset
         );
-        this.offset += stream.size;
+        this.increment(stream.size);
         this.size = this.offset;
         this.endOffset = this.size;
         return this.view.availableSize;
@@ -374,6 +373,9 @@ export class BufferStream {
         }
         if (this.readAheadListeners.length > 0) {
             this.notifyReadAheadListeners();
+        }
+        if (step < 0 && this.availableListeners.length > 0) {
+            this.notifyAvailableListeners();
         }
         return step;
     }
@@ -390,12 +392,15 @@ export class BufferStream {
      * the source without requiring callers to read the rest of it first.
      */
     pumpAsyncStream(stream, options = {}) {
-        const source = BufferStream.asyncSourceFromStream(stream);
-        if (options.requireCancellation && !source.cancellable) {
+        if (
+            options.requireCancellation &&
+            !BufferStream.isCancellableAsyncStream(stream)
+        ) {
             throw new TypeError(
                 "Cancellable stream must be a Node stream or ReadableStream"
             );
         }
+        const source = BufferStream.asyncSourceFromStream(stream);
         let rejectFailure;
         let resolveStop;
         const failure = new Promise((_resolve, reject) => {
@@ -408,44 +413,54 @@ export class BufferStream {
         const state = {
             cancelRequested: false,
             cancelPromise: Promise.resolve(),
+            finalizing: false,
             failure: undefined,
+            hasFailure: false,
             settled: false,
             stopSignal,
             stopped: false
         };
 
         const reportFailure = error => {
-            if (state.failure) {
+            if (state.hasFailure) {
                 return;
             }
-            state.failure = error;
-            rejectFailure(error);
-            this.setFailed(error);
+            const failure = BufferStream.toError(error, "Async stream failed");
+            state.failure = failure;
+            state.hasFailure = true;
+            rejectFailure(failure);
+            this.setFailed(failure);
         };
 
         const cancel = error => {
-            if (error) {
+            if (error !== undefined) {
                 reportFailure(error);
             }
-            if (state.cancelRequested || state.settled) {
+            if (state.cancelRequested || state.finalizing || state.settled) {
                 return;
             }
             state.cancelRequested = true;
             state.stopped = true;
             resolveStop();
-            const cancelSource = error ? source.abort : source.stop;
-            const reason = error ?? BufferStream.createStopReason();
+            const cancelSource =
+                error !== undefined ? source.abort : source.stop;
+            const reason =
+                error !== undefined
+                    ? state.failure
+                    : BufferStream.createStopReason();
             state.cancelPromise = BufferStream.cancelSource(
                 cancelSource,
                 reason
             );
-            if (!error) {
+            if (error === undefined) {
                 this.setComplete();
             }
         };
         state.cancel = cancel;
         state.reportFailure = reportFailure;
-        state.removeErrorListener = source.onError?.(cancel);
+        state.removeErrorListener = source.onError?.(error =>
+            cancel(BufferStream.toError(error, "Async source failed"))
+        );
 
         const finished = this._pumpAsyncStream(source, state, options);
         finished.catch(() => {});
@@ -457,7 +472,7 @@ export class BufferStream {
             finished,
             stop: () => cancel(),
             get aborted() {
-                return !!state.failure;
+                return state.hasFailure;
             },
             get reason() {
                 return state.failure;
@@ -469,6 +484,7 @@ export class BufferStream {
     }
 
     async _pumpAsyncStream(source, state, options) {
+        let reachedEnd = false;
         try {
             while (!state.stopped) {
                 const next = Promise.resolve()
@@ -480,6 +496,7 @@ export class BufferStream {
                 }
                 const { done, value } = nextResult.result;
                 if (done) {
+                    reachedEnd = true;
                     break;
                 }
                 this.addBuffer(BufferStream.arrayBufferFromChunk(value));
@@ -491,12 +508,24 @@ export class BufferStream {
         } catch (error) {
             const expectedStopError =
                 state.stopped &&
-                !state.failure &&
+                !state.hasFailure &&
                 source.isExpectedStopError?.(error);
-            if (!expectedStopError && error !== state.failure) {
-                state.cancel(error);
+            const isReportedFailure =
+                state.hasFailure && error === state.failure;
+            if (!expectedStopError && !isReportedFailure) {
+                state.cancel(
+                    BufferStream.toError(error, "Async source failed")
+                );
             }
         } finally {
+            if (
+                reachedEnd &&
+                options.requireCancellation &&
+                !state.cancelRequested
+            ) {
+                state.cancel();
+            }
+            state.finalizing = true;
             try {
                 await state.cancelPromise;
             } catch (error) {
@@ -509,13 +538,13 @@ export class BufferStream {
                 }
                 state.removeErrorListener?.();
                 state.settled = true;
-                if (!state.failure) {
+                if (!state.hasFailure) {
                     this.setComplete();
                 }
             }
         }
 
-        if (state.failure) {
+        if (state.hasFailure) {
             throw state.failure;
         }
     }
@@ -524,11 +553,11 @@ export class BufferStream {
         return new Error("BufferStream stopped");
     }
 
-    static toError(error) {
+    static toError(error, fallbackMessage = "BufferStream aborted") {
         if (error instanceof Error) {
             return error;
         }
-        return new Error(error ? String(error) : "BufferStream aborted");
+        return new Error(error ? String(error) : fallbackMessage);
     }
 
     static cancelSource(cancelSource, reason) {
@@ -539,9 +568,23 @@ export class BufferStream {
         }
     }
 
+    static isCancellableAsyncStream(stream) {
+        if (typeof stream?.getReader === "function") {
+            return true;
+        }
+        return (
+            typeof stream?.[Symbol.asyncIterator] === "function" &&
+            typeof stream.destroy === "function" &&
+            typeof stream.once === "function" &&
+            typeof stream.on === "function" &&
+            typeof stream.off === "function"
+        );
+    }
+
     static destroyNodeStream(stream, reason) {
         if (
             typeof stream.once !== "function" ||
+            typeof stream.on !== "function" ||
             typeof stream.off !== "function"
         ) {
             stream.destroy(reason);
@@ -611,6 +654,7 @@ export class BufferStream {
             const hasDestroy = typeof stream.destroy === "function";
             const canObserveClose =
                 typeof stream.once === "function" &&
+                typeof stream.on === "function" &&
                 typeof stream.off === "function";
             return {
                 cancellable: hasDestroy && canObserveClose,
@@ -759,7 +803,7 @@ export class BufferStream {
     }
 
     reset() {
-        this.offset = 0;
+        this.increment(-this.offset);
         return this;
     }
 
@@ -817,7 +861,7 @@ export class ReadBufferStream extends BufferStream {
     }
 
     reset() {
-        this.offset = this.startOffset;
+        this.increment(this.startOffset - this.offset);
         return this;
     }
 
